@@ -1,4 +1,4 @@
-export type RoomPhase = "SETUP" | "FILLING" | "COUNTDOWN" | "PLAYING" | "FINISHED";
+export type RoomPhase = "SETUP" | "FILLING" | "PLAYING" | "FINISHED";
 export type VictoryMode = "FIRST" | "ALL_BUT_ONE";
 export type MarkingMode = "STRICT" | "LOOSE";
 export type PlayerStatus = "ACTIVE" | "COMPLETED";

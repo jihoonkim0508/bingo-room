@@ -9,8 +9,8 @@ import { Label } from "./components/ui/label";
 import { Separator } from "./components/ui/separator";
 import { Slider } from "./components/ui/slider";
 import { Switch } from "./components/ui/switch";
-import { applyStrictMarks, createInitialRoom, emptyBoard, isRoomHost, maxBingos, nextActiveTurn, normalizeWord, settingsForSize, shuffle, validateBoard, countBingos } from "./lib/game";
-import { createRemoteRoom, deleteRemoteRoom, firebaseEnabled, getFirebaseUserId, makeRoomKey, readRoom, registerHostRoomCleanup, updateRemoteRoom, watchFirebaseConnection, watchRemoteRoom } from "./lib/firebase";
+import { applyStrictMarks, createInitialRoom, emptyBoard, isAllReady, isRoomHost, maxBingos, nextActiveTurn, normalizeWord, settingsForSize, shuffle, validateBoard, countBingos } from "./lib/game";
+import { createRemoteRoom, deleteRemoteRoom, firebaseEnabled, getFirebaseUserId, joinRemoteRoom, makeRoomKey, readRoom, registerHostRoomCleanup, registerPlayerPresence, setPlayerConnected, transactRemoteRoom, watchFirebaseConnection, watchRemoteRoom, type RoomOperation } from "./lib/firebase";
 import { formatTime, makeId } from "./lib/utils";
 import type { BoardCell, ChatMessage, Player, RoomSettings, RoomState } from "./types";
 
@@ -19,18 +19,6 @@ type Screen = "home" | "room";
 const demoUserKey = "bingo-demo-user-id";
 const demoUserId = typeof localStorage === "undefined" ? makeId("guest") : localStorage.getItem(demoUserKey) ?? makeId("guest");
 if (typeof localStorage !== "undefined") localStorage.setItem(demoUserKey, demoUserId);
-
-function hydrateRoom(value: RoomState): RoomState {
-  return applyStrictMarks({
-    ...value,
-    players: Array.isArray(value.players) ? value.players : Object.values(value.players ?? {}),
-    calls: Array.isArray(value.calls) ? value.calls : Object.values(value.calls ?? {}),
-    messages: Array.isArray(value.messages) ? value.messages : Object.values(value.messages ?? {}),
-    boards: value.boards ?? {},
-    turnOrder: Array.isArray(value.turnOrder) ? value.turnOrder : Object.values(value.turnOrder ?? {}),
-    winnerIds: Array.isArray(value.winnerIds) ? value.winnerIds : Object.values(value.winnerIds ?? {}),
-  });
-}
 
 function App() {
   const [screen, setScreen] = useState<Screen>("home");
@@ -51,14 +39,9 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!firebaseEnabled) return;
-    return watchFirebaseConnection(setFirebaseConnected);
-  }, []);
-
-  useEffect(() => {
     if (!firebaseEnabled || !roomKey) return;
     return watchRemoteRoom(roomKey, (next) => {
-      if (next) setRoom(hydrateRoom(next));
+      if (next) setRoom(next);
       else {
         setRoom(null);
         setRoomKey("");
@@ -68,15 +51,27 @@ function App() {
     });
   }, [roomKey]);
 
+  useEffect(() => {
+    if (!firebaseEnabled) return;
+    return watchFirebaseConnection((connected) => {
+      setFirebaseConnected(connected);
+      if (roomKey && userId) {
+        setRoom((current) => current ? { ...current, players: current.players.map((player) => player.id === userId ? { ...player, connected } : player) } : current);
+        if (connected) void registerPlayerPresence(roomKey, userId).catch(() => undefined);
+      }
+    });
+  }, [roomKey, userId]);
+
   const isCurrentUserHost = room?.hostId === userId;
 
   const leaveRoom = useCallback(() => {
     if (firebaseEnabled && roomKey && isCurrentUserHost) void deleteRemoteRoom(roomKey).catch(() => undefined);
+    if (firebaseEnabled && roomKey && userId && !isCurrentUserHost) void setPlayerConnected(roomKey, userId, false).catch(() => undefined);
     setRoom(null);
     setRoomKey("");
     setScreen("home");
     setNotice("");
-  }, [isCurrentUserHost, roomKey]);
+  }, [isCurrentUserHost, roomKey, userId]);
 
   useEffect(() => {
     if (screen !== "room" || !room || !roomKey) return;
@@ -86,13 +81,23 @@ function App() {
     return () => window.removeEventListener("popstate", handlePopState);
   }, [leaveRoom, room?.hostId, roomKey, screen]);
 
-  const commit = useCallback((next: RoomState) => {
+  const commit = useCallback((next: RoomState, operation: RoomOperation) => {
     const synchronized = applyStrictMarks(next);
     setRoom(synchronized);
     if (firebaseEnabled && roomKey) {
-      void updateRemoteRoom(roomKey, synchronized).catch(() => setNotice("저장에 실패했습니다. 네트워크를 확인해주세요."));
+      void transactRemoteRoom(roomKey, operation).then((result) => {
+        if (result.room) setRoom(result.room);
+        if (!result.committed) setNotice("최신 방 상태와 충돌했습니다. 다시 시도해주세요.");
+      }).catch(() => setNotice("저장에 실패했습니다. 네트워크를 확인해주세요."));
     }
   }, [roomKey]);
+
+  useEffect(() => {
+    if (!room || room.phase !== "FILLING" || room.hostId !== userId || !isAllReady(room)) return;
+    const turnOrder = shuffle(room.players.map((player) => player.id));
+    const next = { ...room, phase: "PLAYING" as const, countdownStartedAt: undefined, turnOrder, currentTurnIndex: 0 };
+    commit(next, (latest) => latest.hostId === userId && latest.phase === "FILLING" && isAllReady(latest) ? { ...latest, phase: "PLAYING", countdownStartedAt: undefined, turnOrder: shuffle(latest.players.map((player) => player.id)), currentTurnIndex: 0 } : null);
+  }, [commit, room, userId]);
 
   async function createRoom(nickname: string, roomName: string, password: string) {
     if (!nickname.trim() || !roomName.trim() || password.length < 4) return setNotice("닉네임, 방 이름을 입력하고 비밀번호는 4자 이상 사용해주세요.");
@@ -104,6 +109,7 @@ function App() {
       if (firebaseEnabled) {
         await createRemoteRoom(key, next);
         await registerHostRoomCleanup(key);
+        await registerPlayerPresence(key, userId);
       }
       setRoomKey(key);
       setRoom(next);
@@ -123,14 +129,23 @@ function App() {
       const key = firebaseEnabled ? await makeRoomKey(roomName, password) : `demo-${normalizeWord(roomName)}-${normalizeWord(password)}`;
       const existing = firebaseEnabled ? await readRoom(key) : null;
       if (firebaseEnabled && !existing) return setNotice("방이 없거나 비밀번호가 올바르지 않습니다.");
-      const current = existing ? hydrateRoom(existing) : createInitialRoom(key, roomName.trim(), "host-demo", "방장");
+      const current = existing ?? createInitialRoom(key, roomName.trim(), "host-demo", "방장");
       if (current.phase !== "SETUP") return setNotice("이미 시작된 방에는 새로 들어갈 수 없습니다.");
       if (!current.players.some((player) => player.id === userId) && current.players.length >= current.settings.maxPlayers) return setNotice("방 인원이 가득 찼습니다.");
       const player: Player = { id: userId, nickname: nickname.trim(), ready: false, connected: true, status: "ACTIVE", bingoCount: 0 };
-      const next = { ...current, players: current.players.some((item) => item.id === userId) ? current.players : [...current.players, player] };
+      let next = current;
       if (firebaseEnabled) {
-        await createRemoteRoom(key, next);
+        const result = await joinRemoteRoom(key, player);
+        if (!result.committed || !result.room) {
+          if (result.reason === "STARTED" || result.room?.phase !== "SETUP") return setNotice("이미 시작된 방에는 새로 들어갈 수 없습니다.");
+          if (result.reason === "NICKNAME") return setNotice("이미 사용 중인 닉네임입니다.");
+          return setNotice("방 인원이 가득 찼습니다.");
+        }
+        next = result.room;
         if (current.hostId === userId) await registerHostRoomCleanup(key);
+        await registerPlayerPresence(key, userId);
+      } else {
+        next = { ...current, players: current.players.some((item) => item.id === userId) ? current.players : [...current.players, player] };
       }
       setRoomKey(key);
       setRoom(next);
@@ -203,7 +218,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   return <div className="space-y-2"><Label>{label}</Label>{children}</div>;
 }
 
-function RoomScreen({ room, userId, firebaseConnected, onCommit, onLeave, notice, setNotice }: { room: RoomState; userId: string; firebaseConnected: boolean; onCommit: (room: RoomState) => void; onLeave: () => void; notice: string; setNotice: (value: string) => void }) {
+function RoomScreen({ room, userId, firebaseConnected, onCommit, onLeave, notice, setNotice }: { room: RoomState; userId: string; firebaseConnected: boolean; onCommit: (room: RoomState, operation: RoomOperation) => void; onLeave: () => void; notice: string; setNotice: (value: string) => void }) {
   const me = room.players.find((player) => player.id === userId);
   const host = isRoomHost(room, userId);
   const [chatText, setChatText] = useState("");
@@ -214,35 +229,52 @@ function RoomScreen({ room, userId, firebaseConnected, onCommit, onLeave, notice
   const board = room.boards[userId] ?? emptyBoard(room.settings.size);
   const isFinished = room.phase === "FINISHED" || me?.status === "COMPLETED";
 
+  function commit(next: RoomState, operation: RoomOperation) {
+    onCommit(next, operation);
+  }
+
   function updateSettings(settings: RoomSettings) {
     if (!host || room.phase !== "SETUP") return;
-    onCommit({ ...room, settings });
+    commit({ ...room, settings }, (latest) => latest.hostId === userId && latest.phase === "SETUP" ? { ...latest, settings } : null);
   }
 
   function startFilling() {
     if (!host) return;
-    onCommit({ ...room, phase: "FILLING", countdownStartedAt: undefined, players: room.players.map((player) => ({ ...player, ready: false })), boards: {}, calls: [], messages: room.messages.slice(-100), winnerIds: [] });
+    const next = { ...room, phase: "FILLING" as const, countdownStartedAt: undefined, players: room.players.map((player) => ({ ...player, ready: false })), boards: {}, calls: [], messages: room.messages.slice(-100), turnOrder: [], currentTurnIndex: 0, winnerIds: [] };
+    commit(next, (latest) => latest.hostId === userId && latest.phase === "SETUP" ? { ...latest, phase: "FILLING", countdownStartedAt: undefined, players: latest.players.map((player) => ({ ...player, ready: false })), boards: {}, calls: [], messages: latest.messages.slice(-100), turnOrder: [], currentTurnIndex: 0, winnerIds: [] } : null);
     setNotice("");
   }
 
   function resetToSetup() {
     if (!host) return;
     if (!window.confirm("진행 중인 빙고가 취소되고 판과 진행 상황이 초기화됩니다. 계속할까요?")) return;
-    onCommit({ ...room, phase: "SETUP", countdownStartedAt: undefined, players: room.players.map((player) => ({ ...player, ready: false, status: "ACTIVE", bingoCount: 0, rank: undefined, completedAt: undefined })), boards: {}, calls: [], turnOrder: [], currentTurnIndex: 0, winnerIds: [] });
+    const reset = (latest: RoomState): RoomState => ({ ...latest, phase: "SETUP", countdownStartedAt: undefined, players: latest.players.map((player) => ({ ...player, ready: false, status: "ACTIVE", bingoCount: 0, rank: undefined, completedAt: undefined })), boards: {}, calls: [], turnOrder: [], currentTurnIndex: 0, winnerIds: [] });
+    commit(reset(room), (latest) => latest.hostId === userId ? reset(latest) : null);
+  }
+
+  function restartGame() {
+    if (!host) return;
+    const reset = (latest: RoomState): RoomState => ({ ...latest, phase: "SETUP", countdownStartedAt: undefined, players: latest.players.map((player) => ({ ...player, ready: false, status: "ACTIVE", bingoCount: 0, rank: undefined, completedAt: undefined })), boards: {}, calls: [], turnOrder: [], currentTurnIndex: 0, winnerIds: [] });
+    commit(reset(room), (latest) => latest.hostId === userId && latest.phase === "FINISHED" ? reset(latest) : null);
   }
 
   function updateBoard(index: number, text: string) {
     const nextBoard = [...board];
     nextBoard[index] = { ...nextBoard[index], text };
-    onCommit({ ...room, boards: { ...room.boards, [userId]: nextBoard } });
+    commit({ ...room, boards: { ...room.boards, [userId]: nextBoard } }, (latest) => latest.phase === "FILLING" && latest.players.some((player) => player.id === userId) ? { ...latest, boards: { ...latest.boards, [userId]: nextBoard } } : null);
   }
 
   function toggleReady() {
     if (!me || room.phase !== "FILLING") return;
     const nextPlayers = room.players.map((player) => player.id === userId ? { ...player, ready: !player.ready } : player);
     const next = { ...room, players: nextPlayers, boards: { ...room.boards, [userId]: board } };
-    if (nextPlayers.every((player) => player.ready)) onCommit({ ...next, phase: "PLAYING", countdownStartedAt: undefined, turnOrder: shuffle(nextPlayers.map((player) => player.id)), currentTurnIndex: 0 });
-    else onCommit(next);
+    commit(next, (latest) => {
+      if (latest.phase !== "FILLING") return null;
+      const latestMe = latest.players.find((player) => player.id === userId);
+      if (!latestMe) return null;
+      const players = latest.players.map((player) => player.id === userId ? { ...player, ready: !latestMe.ready } : player);
+      return { ...latest, players, boards: { ...latest.boards, [userId]: latest.boards[userId] ?? board } };
+    });
   }
 
   function toggleCell(index: number) {
@@ -250,10 +282,18 @@ function RoomScreen({ room, userId, firebaseConnected, onCommit, onLeave, notice
     const nextBoard = [...board];
     nextBoard[index] = { ...nextBoard[index], marked: !nextBoard[index].marked };
     const count = countBingos(nextBoard, room.settings.size);
-    let nextPlayers = room.players.map((player) => player.id === userId ? { ...player, bingoCount: count } : player);
+    const nextPlayers = room.players.map((player) => player.id === userId ? { ...player, bingoCount: count } : player);
     let next: RoomState = { ...room, boards: { ...room.boards, [userId]: nextBoard }, players: nextPlayers };
     if (count >= room.settings.targetBingos) next = completePlayer(next, userId);
-    onCommit(next);
+    commit(next, (latest) => {
+      if (latest.phase !== "PLAYING" || latest.settings.markingMode !== "LOOSE") return null;
+      const latestBoard = [...(latest.boards[userId] ?? emptyBoard(latest.settings.size))];
+      latestBoard[index] = { ...latestBoard[index], marked: !latestBoard[index].marked };
+      const latestCount = countBingos(latestBoard, latest.settings.size);
+      let updated: RoomState = { ...latest, boards: { ...latest.boards, [userId]: latestBoard }, players: latest.players.map((player) => player.id === userId ? { ...player, bingoCount: latestCount } : player) };
+      if (latestCount >= latest.settings.targetBingos) updated = completePlayer(updated, userId);
+      return updated;
+    });
   }
 
   function completePlayer(source: RoomState, playerId: string) {
@@ -277,13 +317,22 @@ function RoomScreen({ room, userId, firebaseConnected, onCommit, onLeave, notice
     if (count >= room.settings.targetBingos) next = completePlayer(next, userId);
     setCallText("");
     setNotice("");
-    onCommit(next);
+    commit(next, (latest) => {
+      if (latest.phase !== "PLAYING" || latest.turnOrder[latest.currentTurnIndex] !== userId) return null;
+      if (latest.calls.some((call) => normalizeWord(call.text) === normalized)) return null;
+      const latestBoard = latest.boards[userId] ?? emptyBoard(latest.settings.size);
+      const markedBoard = latest.settings.markingMode === "STRICT" ? latestBoard.map((cell) => normalizeWord(cell.text) === normalized ? { ...cell, marked: true } : cell) : latestBoard;
+      const latestCount = countBingos(markedBoard, latest.settings.size);
+      let updated: RoomState = { ...latest, boards: { ...latest.boards, [userId]: markedBoard }, calls: [...latest.calls, call], messages: [...latest.messages, { id: call.id, authorId: userId, authorName: call.callerName, type: "CALL" as const, text: call.text, createdAt: call.createdAt }].slice(-100), players: latest.players.map((player) => player.id === userId ? { ...player, bingoCount: latestCount } : player), currentTurnIndex: nextActiveTurn(latest, latest.currentTurnIndex) };
+      if (latestCount >= latest.settings.targetBingos) updated = completePlayer(updated, userId);
+      return updated;
+    });
   }
 
   function sendChat() {
     if (!chatText.trim() || !me) return;
     const message: ChatMessage = { id: makeId("chat"), authorId: userId, authorName: me.nickname, type: "CHAT", text: chatText.trim(), createdAt: Date.now() };
-    onCommit({ ...room, messages: [...room.messages, message].slice(-100) });
+    commit({ ...room, messages: [...room.messages, message].slice(-100) }, (latest) => ({ ...latest, messages: [...latest.messages, message].slice(-100) }));
     setChatText("");
   }
 
@@ -293,7 +342,7 @@ function RoomScreen({ room, userId, firebaseConnected, onCommit, onLeave, notice
     window.setTimeout(() => setCopied(false), 1500);
   }
 
-  const title = room.phase === "SETUP" ? "방 설정" : room.phase === "FILLING" ? "빙고판 채우기" : room.phase === "COUNTDOWN" ? "곧 시작합니다" : room.phase === "FINISHED" ? "게임 결과" : room.settings.topic;
+  const title = room.phase === "SETUP" ? "방 설정" : room.phase === "FILLING" ? "빙고판 채우기" : room.phase === "FINISHED" ? "게임 결과" : room.settings.topic;
 
   return (
     <main className="min-h-screen px-4 py-5 text-slate-100 sm:px-7">
@@ -313,7 +362,7 @@ function RoomScreen({ room, userId, firebaseConnected, onCommit, onLeave, notice
           <aside className="space-y-5">
             <PlayersCard room={room} userId={userId} />
             {host && room.phase !== "SETUP" && <Button variant="outline" className="w-full" onClick={resetToSetup}><Settings2 size={16} /> 방 설정으로 돌아가기</Button>}
-            {room.phase === "FINISHED" && host && <Button className="w-full" onClick={() => onCommit({ ...room, phase: "SETUP", countdownStartedAt: undefined, players: room.players.map((player) => ({ ...player, ready: false, status: "ACTIVE", bingoCount: 0, rank: undefined, completedAt: undefined })), boards: {}, calls: [], turnOrder: [], currentTurnIndex: 0, winnerIds: [] })}><RotateCcw size={16} /> 다시하기</Button>}
+            {room.phase === "FINISHED" && host && <Button className="w-full" onClick={restartGame}><RotateCcw size={16} /> 다시하기</Button>}
           </aside>
 
           <section className="min-w-0 space-y-5">
@@ -332,12 +381,12 @@ function RoomScreen({ room, userId, firebaseConnected, onCommit, onLeave, notice
 }
 
 function phaseLabel(phase: RoomState["phase"]) {
-  return ({ SETUP: "대기 중", FILLING: "작성 중", COUNTDOWN: "준비 완료", PLAYING: "게임 중", FINISHED: "종료" })[phase];
+  return ({ SETUP: "대기 중", FILLING: "작성 중", PLAYING: "게임 중", FINISHED: "종료" })[phase];
 }
 
 function PlayersCard({ room, userId }: { room: RoomState; userId: string }) {
   const currentTurnId = room.turnOrder[room.currentTurnIndex];
-  return <Card><CardHeader className="pb-3"><CardTitle className="flex items-center gap-2"><Users size={16} className="text-violet-300" /> 참가자 <span className="ml-auto text-xs font-normal text-slate-500">{room.players.length}/{room.settings.maxPlayers}</span></CardTitle></CardHeader><CardContent className="space-y-2">{room.players.map((player) => <div key={player.id} className="flex items-center gap-2 rounded-xl bg-white/[0.035] px-3 py-2.5"><div className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-gradient-to-br from-violet-400 to-fuchsia-500 text-xs font-black text-white">{player.nickname.slice(0, 1)}</div><div className="min-w-0 flex-1"><div className="flex items-center gap-1.5"><p className="truncate text-sm font-semibold text-white">{player.nickname}</p>{player.id === room.hostId && <Crown size={12} className="text-amber-300" />}{player.id === userId && <span className="text-[10px] text-violet-300">나</span>}</div><p className="text-[10px] text-slate-500">{player.status === "COMPLETED" ? `${player.rank ?? ""}위` : player.ready ? "준비 완료" : "대기 중"}</p></div>{player.bingoCount > 0 && <Badge className="shrink-0 border-amber-300/40 bg-amber-300/15 px-2 py-1 text-xs font-black text-amber-100 shadow-[0_0_14px_rgba(252,211,77,0.18)]">{player.bingoCount}빙고!</Badge>}{currentTurnId === player.id && room.phase === "PLAYING" && <Badge className="border-amber-300/20 bg-amber-300/10 px-2 py-0.5 text-[10px] text-amber-200">턴</Badge>}{player.status === "COMPLETED" && <Trophy size={15} className="shrink-0 text-amber-300" />}</div>)}</CardContent></Card>;
+  return <Card><CardHeader className="pb-3"><CardTitle className="flex items-center gap-2"><Users size={16} className="text-violet-300" /> 참가자 <span className="ml-auto text-xs font-normal text-slate-500">{room.players.length}/{room.settings.maxPlayers}</span></CardTitle></CardHeader><CardContent className="space-y-2">{room.players.map((player) => <div key={player.id} className="flex items-center gap-2 rounded-xl bg-white/[0.035] px-3 py-2.5"><div className="relative grid h-8 w-8 shrink-0 place-items-center rounded-full bg-gradient-to-br from-violet-400 to-fuchsia-500 text-xs font-black text-white">{player.nickname.slice(0, 1)}<span className={`absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#171a2c] ${player.connected ? "bg-emerald-300" : "bg-slate-500"}`} aria-label={player.connected ? "온라인" : "오프라인"} /></div><div className="min-w-0 flex-1"><div className="flex items-center gap-1.5"><p className="truncate text-sm font-semibold text-white">{player.nickname}</p>{player.id === room.hostId && <Crown size={12} className="text-amber-300" />}{player.id === userId && <span className="text-[10px] text-violet-300">나</span>}</div><p className="text-[10px] text-slate-500">{player.connected ? "온라인" : "오프라인"} · {player.status === "COMPLETED" ? `${player.rank ?? ""}위` : player.ready ? "준비 완료" : "대기 중"}</p></div>{player.bingoCount > 0 && <Badge className="shrink-0 border-amber-300/40 bg-amber-300/15 px-2 py-1 text-xs font-black text-amber-100 shadow-[0_0_14px_rgba(252,211,77,0.18)]">{player.bingoCount}빙고!</Badge>}{currentTurnId === player.id && room.phase === "PLAYING" && <Badge className="border-amber-300/20 bg-amber-300/10 px-2 py-0.5 text-[10px] text-amber-200">턴</Badge>}{player.status === "COMPLETED" && <Trophy size={15} className="shrink-0 text-amber-300" />}</div>)}</CardContent></Card>;
 }
 
 function SetupPanel({ room, host, onChange, onStart }: { room: RoomState; host: boolean; onChange: (settings: RoomSettings) => void; onStart: () => void }) {

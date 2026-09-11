@@ -3,7 +3,42 @@
     "rooms": {
       "$roomKey": {
         ".read": "auth != null",
-        ".write": "auth != null && (!data.exists() ? newData.child('hostId').val() == auth.uid : data.child('hostId').val() == auth.uid || data.child('players').child(auth.uid).exists() || newData.child('players').child(auth.uid).exists())"
+        ".write": "auth != null && (!data.exists() ? newData.child('hostId').val() == auth.uid : data.child('hostId').val() == auth.uid || data.child('players').child(auth.uid).exists() || newData.child('players').child(auth.uid).exists())",
+        "id": {
+          ".validate": "!data.exists() ? newData.val() == $roomKey : newData.val() == data.val()"
+        },
+        "name": {
+          ".validate": "!data.exists() || newData.val() == data.val()"
+        },
+        "phase": {
+          ".validate": "!data.exists() || newData.val() == data.val() || data.parent().child('hostId').val() == auth.uid || (data.val() == 'PLAYING' && newData.val() == 'FINISHED')"
+        },
+        "hostId": {
+          ".validate": "!data.exists() ? newData.val() == auth.uid : newData.val() == data.val()"
+        },
+        "settings": {
+          ".validate": "!data.exists() || data.parent().child('hostId').val() == auth.uid || newData.val() == data.val()"
+        },
+        "players": {
+          "$playerId": {
+            ".validate": "!data.exists() ? $playerId == auth.uid || data.parent().parent().child('hostId').val() == auth.uid : $playerId == auth.uid || data.parent().parent().child('hostId').val() == auth.uid || (newData.child('id').val() == data.child('id').val() && newData.child('nickname').val() == data.child('nickname').val() && newData.child('ready').val() == data.child('ready').val() && newData.child('connected').val() == data.child('connected').val())"
+          }
+        },
+        "boards": {
+          "$playerId": {
+            ".validate": "!data.exists() ? $playerId == auth.uid || data.parent().parent().child('hostId').val() == auth.uid : $playerId == auth.uid || data.parent().parent().child('hostId').val() == auth.uid || newData.child('text').val() == data.child('text').val()"
+          }
+        },
+        "messages": {
+          "$messageId": {
+            ".validate": "!data.exists() ? newData.child('authorId').val() == auth.uid : newData.val() == data.val() || newData.child('authorId').val() == auth.uid"
+          }
+        },
+        "calls": {
+          "$callId": {
+            ".validate": "!data.exists() ? newData.child('callerId').val() == auth.uid : newData.val() == data.val() || newData.child('callerId').val() == auth.uid"
+          }
+        }
       }
     }
   }
